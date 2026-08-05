@@ -1,0 +1,641 @@
+local Node7Core = exports['node7-core']:GetCoreObject()
+local RestoreLocks = {}
+local PendingUnloads = {}
+
+local function debugPrint(message)
+    if Config.Debug then
+        print(('[node7-wagon-carcasses] %s'):format(tostring(message)))
+    end
+end
+
+local function notify(source, message, kind)
+    Node7Core.Functions.Notify(source, {
+        title = 'Wagon Carcasses',
+        description = tostring(message),
+        type = kind or 'info',
+        duration = 5000,
+    })
+end
+
+local function getPlayer(source)
+    local player = Node7Core.Functions.GetPlayer(tonumber(source))
+    if not player or not player.PlayerData or not player.PlayerData.citizenid then return nil end
+    return player
+end
+
+local function citizenId(source)
+    local player = getPlayer(source)
+    return player and tostring(player.PlayerData.citizenid) or nil
+end
+
+local function getEntity(networkId)
+    networkId = tonumber(networkId) or 0
+    if networkId <= 0 then return nil end
+
+    local ok, entity = pcall(NetworkGetEntityFromNetworkId, networkId)
+    if not ok or not entity or entity == 0 or not DoesEntityExist(entity) then return nil end
+    return entity
+end
+
+local function playerNearEntity(source, entity, maximumDistance)
+    local ped = GetPlayerPed(source)
+    if not ped or ped == 0 or not entity or entity == 0 then return false end
+    return #(GetEntityCoords(ped) - GetEntityCoords(entity)) <= (tonumber(maximumDistance) or 7.0)
+end
+
+local function entitiesNear(a, b, maximumDistance)
+    if not a or not b then return false end
+    return #(GetEntityCoords(a) - GetEntityCoords(b)) <= (tonumber(maximumDistance) or 7.0)
+end
+
+local function hasSharedKey(keys, id)
+    for _, value in ipairs(Node7Carcasses.SafeDecode(keys)) do
+        if tostring(value) == tostring(id) then return true end
+    end
+    return false
+end
+
+local function getWagon(wagonid)
+    return MySQL.single.await([[
+        SELECT `wagonid`, `citizenid`, `model`, `name`, `network_id`, `locked`, `keys`
+        FROM `node7_wagons`
+        WHERE `wagonid` = ?
+        LIMIT 1
+    ]], { tostring(wagonid or '') })
+end
+
+local function isLocked(value)
+    if value == true then return true end
+    if value == false or value == nil then return false end
+    if tonumber(value) ~= nil then return tonumber(value) == 1 end
+
+    value = tostring(value):lower()
+    return value == 'true' or value == 'locked' or value == 'yes' or value == '1'
+end
+
+local function hashEquals(a, b)
+    a, b = tonumber(a), tonumber(b)
+    if not a or not b then return false end
+    if a == b then return true end
+    return (a & 0xFFFFFFFF) == (b & 0xFFFFFFFF)
+end
+
+local function wagonModelHash(model)
+    local numeric = tonumber(model)
+    if numeric then return numeric end
+    if model == nil or tostring(model) == '' then return nil end
+    return joaat(tostring(model))
+end
+
+local function canAccessWagon(source, wagon)
+    local id = citizenId(source)
+    if not id or not wagon then return false, 'player_missing' end
+
+    -- Locked means nobody opens carcass storage, including the owner.
+    if isLocked(wagon.locked) then return false, 'wagon_locked' end
+    if tostring(wagon.citizenid) == id then return true end
+    if hasSharedKey(wagon.keys, id) then return true end
+
+    return false, 'no_access'
+end
+
+local function validateWagonAccess(source, wagonid, networkId)
+    local wagon = getWagon(wagonid)
+    if not wagon then return nil, nil, 'wagon_missing' end
+
+    networkId = tonumber(networkId) or 0
+    local entity = getEntity(networkId)
+    if not entity then return nil, nil, 'wagon_entity_missing' end
+    if not playerNearEntity(source, entity, (Config.Interaction or {}).serverDistance) then
+        return nil, nil, 'too_far'
+    end
+
+    local stateOk, state = pcall(function() return Entity(entity).state end)
+    if stateOk and state and state.node7WagonId and tostring(state.node7WagonId) ~= tostring(wagonid) then
+        return nil, nil, 'wagon_state_mismatch'
+    end
+
+    local expectedModel = wagonModelHash(wagon.model)
+    if expectedModel and not hashEquals(GetEntityModel(entity), expectedModel) then
+        return nil, nil, 'wagon_model_mismatch'
+    end
+
+    local allowed, reason = canAccessWagon(source, wagon)
+    if not allowed then return nil, nil, reason end
+
+    return wagon, entity
+end
+
+local function isDeadEntity(entity)
+    if not entity or entity == 0 then return false end
+
+    if type(IsPedDeadOrDying) == 'function' then
+        local ok, dead = pcall(IsPedDeadOrDying, entity, true)
+        if ok and dead == true then return true end
+    end
+
+    if type(IsPedFatallyInjured) == 'function' then
+        local ok, dead = pcall(IsPedFatallyInjured, entity)
+        if ok and dead == true then return true end
+    end
+
+    if type(IsEntityDead) == 'function' then
+        local ok, dead = pcall(IsEntityDead, entity)
+        if ok and dead == true then return true end
+    end
+
+    if type(GetEntityHealth) == 'function' then
+        local ok, health = pcall(GetEntityHealth, entity)
+        if ok and tonumber(health) and tonumber(health) <= 0 then return true end
+    end
+
+    return false
+end
+
+local function validateCarcassEntity(networkId, expectedModel, source, allowCarried)
+    local entity = getEntity(networkId)
+    if not entity then return nil, 'carcass_entity_missing' end
+
+    local entityType = 0
+    if type(GetEntityType) == 'function' then
+        local ok, value = pcall(GetEntityType, entity)
+        if ok then entityType = tonumber(value) or 0 end
+    end
+
+    if entityType ~= 1 then return nil, 'carcass_not_ped' end
+
+    local model = GetEntityModel(entity)
+    if not Node7Carcasses.HashEquals(model, expectedModel) then return nil, 'carcass_model_mismatch' end
+    if not Node7Carcasses.IsAnimalModel(model) then return nil, 'animal_blacklisted' end
+
+    if not isDeadEntity(entity) then
+        -- Rockstar's active shoulder-carry state can briefly report a living
+        -- health state to the server even though the client owns a dead animal
+        -- carcass. Only permit that narrow case when the requesting player and
+        -- the exact whitelisted animal network entity are physically together.
+        local carriedPhysicalMatch = allowCarried == true
+            and source ~= nil
+            and playerNearEntity(source, entity, 2.75)
+
+        if not carriedPhysicalMatch then return nil, 'animal_not_dead' end
+    end
+
+    return entity
+end
+
+local function createSchema()
+    MySQL.query.await([[
+        CREATE TABLE IF NOT EXISTS `node7_wagon_carcasses` (
+            `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `wagonid` VARCHAR(16) NOT NULL,
+            `owner_citizenid` VARCHAR(50) NOT NULL,
+            `loaded_by` VARCHAR(50) NOT NULL,
+            `animal_model` BIGINT NOT NULL,
+            `animal_model_name` VARCHAR(64) NOT NULL,
+            `label` VARCHAR(64) NOT NULL,
+            `group_name` VARCHAR(32) NOT NULL,
+            `slot` INT UNSIGNED NOT NULL,
+            `live_net_id` INT UNSIGNED NOT NULL DEFAULT 0,
+            `status` VARCHAR(20) NOT NULL DEFAULT 'loaded',
+            `created_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `node7_wagon_carcasses_slot_unique` (`wagonid`, `slot`),
+            KEY `node7_wagon_carcasses_wagon_index` (`wagonid`),
+            KEY `node7_wagon_carcasses_live_index` (`live_net_id`),
+            CONSTRAINT `node7_wagon_carcasses_wagon_fk`
+                FOREIGN KEY (`wagonid`) REFERENCES `node7_wagons` (`wagonid`)
+                ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    ]])
+end
+
+local function findFreeSlot(wagonid, capacity)
+    local rows = MySQL.query.await(
+        'SELECT `slot` FROM `node7_wagon_carcasses` WHERE `wagonid` = ? ORDER BY `slot` ASC',
+        { wagonid }
+    ) or {}
+
+    local used = {}
+    for _, row in ipairs(rows) do used[tonumber(row.slot)] = true end
+
+    for slot = 1, capacity do
+        if not used[slot] then return slot end
+    end
+
+    return nil
+end
+
+CreateThread(function()
+    while GetResourceState('oxmysql') ~= 'started' do Wait(250) end
+    createSchema()
+
+    local loadTimeout = math.max(30, math.floor(tonumber(Config.PendingLoadTimeoutSeconds) or 90))
+    local unloadTimeout = math.max(30, math.floor(tonumber(Config.PendingUnloadTimeoutSeconds) or 45))
+
+    MySQL.update.await(([[
+        DELETE FROM `node7_wagon_carcasses`
+        WHERE `status` = 'pending_load'
+          AND `updated_at` < (CURRENT_TIMESTAMP - INTERVAL %d SECOND)
+    ]]):format(loadTimeout))
+
+    MySQL.update.await(([[
+        UPDATE `node7_wagon_carcasses`
+        SET `status` = 'loaded'
+        WHERE `status` = 'pending_unload'
+          AND `updated_at` < (CURRENT_TIMESTAMP - INTERVAL %d SECOND)
+    ]]):format(unloadTimeout))
+
+    print(('[node7-wagon-carcasses] Database ready. v%s'):format(Config.Version))
+end)
+
+CreateThread(function()
+    while true do
+        Wait(60000)
+
+        local loadTimeout = math.max(30, math.floor(tonumber(Config.PendingLoadTimeoutSeconds) or 90))
+        local unloadTimeout = math.max(30, math.floor(tonumber(Config.PendingUnloadTimeoutSeconds) or 45))
+
+        MySQL.update.await(([[
+            DELETE FROM `node7_wagon_carcasses`
+            WHERE `status` = 'pending_load'
+              AND `updated_at` < (CURRENT_TIMESTAMP - INTERVAL %d SECOND)
+        ]]):format(loadTimeout))
+
+        MySQL.update.await(([[
+            UPDATE `node7_wagon_carcasses`
+            SET `status` = 'loaded'
+            WHERE `status` = 'pending_unload'
+              AND `updated_at` < (CURRENT_TIMESTAMP - INTERVAL %d SECOND)
+        ]]):format(unloadTimeout))
+
+        local now = os.time()
+        for recordId, pending in pairs(PendingUnloads) do
+            if not pending or pending.expires < now then
+                PendingUnloads[recordId] = nil
+            end
+        end
+    end
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:server:reserveLoad', function(payload)
+    local source = source
+    payload = type(payload) == 'table' and payload or {}
+
+    local wagonid = tostring(payload.wagonid or '')
+    local wagonNetId = tonumber(payload.wagonNetId) or 0
+    local carcassNetId = tonumber(payload.carcassNetId) or 0
+    local animalModel = tonumber(payload.animalModel) or 0
+    local wasCarried = payload.wasCarried == true
+    if wagonid == '' or wagonNetId == 0 or carcassNetId == 0 or animalModel == 0 then return end
+
+    local wagon, wagonEntity, reason = validateWagonAccess(source, wagonid, wagonNetId)
+    if not wagon then
+        notify(source, reason == 'wagon_locked' and 'This wagon is locked.' or 'You cannot use this wagon.', 'error')
+        return
+    end
+
+    local carcass, carcassReason = validateCarcassEntity(carcassNetId, animalModel, source, wasCarried)
+    if not carcass then
+        notify(source, ('Carcass rejected: %s.'):format(carcassReason), 'error')
+        return
+    end
+
+    if not playerNearEntity(source, carcass, 4.0) or not entitiesNear(wagonEntity, carcass, 8.0) then
+        notify(source, 'Carry the carcass to the rear of the wagon.', 'error')
+        return
+    end
+
+    local duplicate = MySQL.scalar.await(
+        'SELECT `id` FROM `node7_wagon_carcasses` WHERE `live_net_id` = ? LIMIT 1',
+        { carcassNetId }
+    )
+    if duplicate then
+        notify(source, 'That carcass is already stored.', 'error')
+        return
+    end
+
+    local capacity = Node7Carcasses.GetCapacity(wagon.model)
+    local slot = findFreeSlot(wagonid, capacity)
+    if not slot then
+        notify(source, ('This wagon is full (%s carcasses).'):format(capacity), 'error')
+        return
+    end
+
+    local profile = Node7Carcasses.GetAnimalProfile(animalModel)
+    if not profile then
+        notify(source, 'That animal is blacklisted from carcass storage.', 'error')
+        return
+    end
+
+    local loader = citizenId(source)
+    local recordId = MySQL.insert.await([[
+        INSERT INTO `node7_wagon_carcasses`
+            (`wagonid`, `owner_citizenid`, `loaded_by`, `animal_model`, `animal_model_name`,
+             `label`, `group_name`, `slot`, `live_net_id`, `status`)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_load')
+    ]], {
+        wagonid,
+        tostring(wagon.citizenid),
+        loader,
+        animalModel,
+        profile.modelName,
+        profile.label,
+        profile.group,
+        slot,
+        carcassNetId,
+    })
+
+    if not recordId then
+        notify(source, 'The wagon slot could not be reserved.', 'error')
+        return
+    end
+
+    TriggerClientEvent('node7-wagon-carcasses:client:attachReserved', source, {
+        id = recordId,
+        wagonid = wagonid,
+        wagonNetId = wagonNetId,
+        carcassNetId = carcassNetId,
+        model = animalModel,
+        label = profile.label,
+        group_name = profile.group,
+        slot = slot,
+    })
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:server:confirmLoaded', function(recordId, liveNetId)
+    local source = source
+    local loader = citizenId(source)
+    recordId = tonumber(recordId)
+    liveNetId = tonumber(liveNetId) or 0
+    if not loader or not recordId or liveNetId == 0 then return end
+
+    local record = MySQL.single.await([[
+        SELECT `id`, `wagonid`, `animal_model`, `loaded_by`, `status`
+        FROM `node7_wagon_carcasses`
+        WHERE `id` = ?
+        LIMIT 1
+    ]], { recordId })
+
+    if not record or tostring(record.loaded_by) ~= loader or record.status ~= 'pending_load' then return end
+
+    local carcass = validateCarcassEntity(liveNetId, tonumber(record.animal_model), source, true)
+    if not carcass then
+        MySQL.query.await('DELETE FROM `node7_wagon_carcasses` WHERE `id` = ? AND `status` = ?', {
+            recordId, 'pending_load'
+        })
+        notify(source, 'The carcass attachment could not be verified.', 'error')
+        return
+    end
+
+    MySQL.update.await([[
+        UPDATE `node7_wagon_carcasses`
+        SET `live_net_id` = ?, `status` = 'loaded'
+        WHERE `id` = ? AND `status` = 'pending_load'
+    ]], { liveNetId, recordId })
+
+    notify(source, 'Carcass loaded onto the wagon.', 'success')
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:server:loadFailed', function(recordId, reason)
+    local source = source
+    local loader = citizenId(source)
+    recordId = tonumber(recordId)
+    if not loader or not recordId then return end
+
+    MySQL.query.await([[
+        DELETE FROM `node7_wagon_carcasses`
+        WHERE `id` = ? AND `loaded_by` = ? AND `status` = 'pending_load'
+    ]], { recordId, loader })
+
+    debugPrint(('load failed id=%s src=%s reason=%s'):format(recordId, source, tostring(reason)))
+    notify(source, 'The carcass was not loaded.', 'error')
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:server:list', function(wagonid, wagonNetId)
+    local source = source
+    wagonid = tostring(wagonid or '')
+    wagonNetId = tonumber(wagonNetId) or 0
+
+    local wagon, _, reason = validateWagonAccess(source, wagonid, wagonNetId)
+    if not wagon then
+        notify(source, reason == 'wagon_locked' and 'This wagon is locked.' or 'You cannot access this wagon.', 'error')
+        return
+    end
+
+    local records = MySQL.query.await([[
+        SELECT `id`, `wagonid`, `animal_model` AS `model`, `animal_model_name`,
+               `label`, `group_name`, `slot`, `live_net_id`, `created_at`
+        FROM `node7_wagon_carcasses`
+        WHERE `wagonid` = ? AND `status` = 'loaded'
+        ORDER BY `slot` ASC
+    ]], { wagonid }) or {}
+
+    TriggerClientEvent('node7-wagon-carcasses:client:list', source, records, wagonid, wagonNetId)
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:server:requestUnload', function(payload)
+    local source = source
+    payload = type(payload) == 'table' and payload or {}
+
+    local recordId = tonumber(payload.id)
+    local wagonid = tostring(payload.wagonid or '')
+    local wagonNetId = tonumber(payload.wagonNetId) or 0
+    if not recordId or wagonid == '' or wagonNetId == 0 then return end
+
+    local wagon, _, reason = validateWagonAccess(source, wagonid, wagonNetId)
+    if not wagon then
+        notify(source, reason == 'wagon_locked' and 'This wagon is locked.' or 'You cannot access this wagon.', 'error')
+        return
+    end
+
+    local changed = MySQL.update.await([[
+        UPDATE `node7_wagon_carcasses`
+        SET `status` = 'pending_unload'
+        WHERE `id` = ? AND `wagonid` = ? AND `status` = 'loaded'
+    ]], { recordId, wagonid })
+
+    if not changed or changed < 1 then
+        notify(source, 'That carcass is no longer available.', 'error')
+        return
+    end
+
+    local record = MySQL.single.await([[
+        SELECT `id`, `wagonid`, `animal_model` AS `model`, `animal_model_name`,
+               `label`, `group_name`, `slot`, `live_net_id`
+        FROM `node7_wagon_carcasses`
+        WHERE `id` = ? AND `wagonid` = ? AND `status` = 'pending_unload'
+        LIMIT 1
+    ]], { recordId, wagonid })
+
+    if not record then return end
+
+    PendingUnloads[recordId] = {
+        source = source,
+        citizenid = citizenId(source),
+        wagonid = wagonid,
+        wagonNetId = wagonNetId,
+        expires = os.time() + math.max(30, math.floor(tonumber(Config.PendingUnloadTimeoutSeconds) or 45)),
+    }
+
+    TriggerClientEvent('node7-wagon-carcasses:client:unload', source, record, wagonNetId)
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:server:confirmUnloaded', function(recordId, recreated)
+    local source = source
+    recordId = tonumber(recordId)
+    if not recordId then return end
+
+    local pending = PendingUnloads[recordId]
+    if not pending
+        or tonumber(pending.source) ~= tonumber(source)
+        or pending.expires < os.time()
+        or tostring(pending.citizenid or '') ~= tostring(citizenId(source) or '') then
+        return
+    end
+
+    local record = MySQL.single.await([[
+        SELECT `id`, `wagonid`
+        FROM `node7_wagon_carcasses`
+        WHERE `id` = ? AND `wagonid` = ? AND `status` = 'pending_unload'
+        LIMIT 1
+    ]], { recordId, tostring(pending.wagonid) })
+    if not record then
+        PendingUnloads[recordId] = nil
+        return
+    end
+
+    local changed = MySQL.update.await(
+        'DELETE FROM `node7_wagon_carcasses` WHERE `id` = ? AND `wagonid` = ? AND `status` = ?',
+        { recordId, tostring(pending.wagonid), 'pending_unload' }
+    )
+
+    PendingUnloads[recordId] = nil
+    if changed and changed > 0 then
+        notify(source, recreated and 'Carcass restored and placed behind the wagon.' or 'Carcass placed behind the wagon.', 'success')
+    end
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:server:unloadFailed', function(recordId, reason)
+    local source = source
+    recordId = tonumber(recordId)
+    if not recordId then return end
+
+    local pending = PendingUnloads[recordId]
+    if pending and tonumber(pending.source) ~= tonumber(source) then return end
+
+    MySQL.update.await([[
+        UPDATE `node7_wagon_carcasses`
+        SET `status` = 'loaded'
+        WHERE `id` = ? AND `status` = 'pending_unload'
+    ]], { recordId })
+
+    PendingUnloads[recordId] = nil
+    debugPrint(('unload failed id=%s src=%s reason=%s'):format(recordId, source, tostring(reason)))
+    notify(source, 'The carcass stayed safely stored because unloading failed.', 'error')
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:server:requestRestore', function(wagonid, wagonNetId)
+    local source = source
+    wagonid = tostring(wagonid or '')
+    wagonNetId = tonumber(wagonNetId) or 0
+    if wagonid == '' or wagonNetId == 0 then return end
+
+    local wagon = validateWagonAccess(source, wagonid, wagonNetId)
+    if not wagon then return end
+
+    local now = os.time()
+    local lock = RestoreLocks[wagonid]
+    if lock and lock.expires > now and lock.source ~= source then return end
+    RestoreLocks[wagonid] = { source = source, expires = now + 8 }
+
+    local records = MySQL.query.await([[
+        SELECT `id`, `wagonid`, `animal_model` AS `model`, `animal_model_name`,
+               `label`, `group_name`, `slot`, `live_net_id`
+        FROM `node7_wagon_carcasses`
+        WHERE `wagonid` = ? AND `status` = 'loaded'
+        ORDER BY `slot` ASC
+    ]], { wagonid }) or {}
+
+    if #records > 0 then
+        TriggerClientEvent('node7-wagon-carcasses:client:restore', source, records, wagonid, wagonNetId)
+    end
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:server:updateLiveEntity', function(recordId, liveNetId, wagonid, wagonNetId)
+    local source = source
+    recordId = tonumber(recordId)
+    liveNetId = tonumber(liveNetId) or 0
+    wagonid = tostring(wagonid or '')
+    wagonNetId = tonumber(wagonNetId) or 0
+    if not recordId or liveNetId == 0 or wagonid == '' then return end
+
+    local wagon = validateWagonAccess(source, wagonid, wagonNetId)
+    if not wagon then return end
+
+    local record = MySQL.single.await([[
+        SELECT `animal_model`
+        FROM `node7_wagon_carcasses`
+        WHERE `id` = ? AND `wagonid` = ? AND `status` = 'loaded'
+        LIMIT 1
+    ]], { recordId, wagonid })
+    if not record then return end
+
+    local carcass = validateCarcassEntity(liveNetId, tonumber(record.animal_model))
+    if not carcass then return end
+
+    MySQL.update.await(
+        'UPDATE `node7_wagon_carcasses` SET `live_net_id` = ? WHERE `id` = ? AND `wagonid` = ?',
+        { liveNetId, recordId, wagonid }
+    )
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:server:markOffline', function(recordId)
+    local source = source
+    recordId = tonumber(recordId)
+    if not recordId then return end
+
+    local record = MySQL.single.await(
+        'SELECT `wagonid` FROM `node7_wagon_carcasses` WHERE `id` = ? LIMIT 1',
+        { recordId }
+    )
+    if not record then return end
+
+    local wagon = getWagon(record.wagonid)
+    local id = citizenId(source)
+    if not wagon or not id then return end
+
+    if tostring(wagon.citizenid) ~= id and not hasSharedKey(wagon.keys, id) then return end
+
+    MySQL.update.await(
+        'UPDATE `node7_wagon_carcasses` SET `live_net_id` = 0 WHERE `id` = ?',
+        { recordId }
+    )
+end)
+
+exports('GetWagonCarcasses', function(wagonid)
+    return MySQL.query.await([[
+        SELECT `id`, `wagonid`, `animal_model` AS `model`, `animal_model_name`,
+               `label`, `group_name`, `slot`, `live_net_id`, `status`, `created_at`
+        FROM `node7_wagon_carcasses`
+        WHERE `wagonid` = ? AND `status` = 'loaded'
+        ORDER BY `slot` ASC
+    ]], { tostring(wagonid or '') }) or {}
+end)
+
+exports('RemoveWagonCarcass', function(wagonid, recordId)
+    local changed = MySQL.update.await(
+        'DELETE FROM `node7_wagon_carcasses` WHERE `wagonid` = ? AND `id` = ?',
+        { tostring(wagonid or ''), tonumber(recordId) or 0 }
+    )
+    return tonumber(changed) and tonumber(changed) > 0
+end)
+
+AddEventHandler('playerDropped', function()
+    local dropped = source
+    for recordId, pending in pairs(PendingUnloads) do
+        if pending and tonumber(pending.source) == tonumber(dropped) then
+            PendingUnloads[recordId] = nil
+        end
+    end
+end)

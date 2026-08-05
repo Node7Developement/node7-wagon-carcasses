@@ -1,0 +1,21 @@
+name: node7-wagon-carcasses
+version: 1.0.5
+author: NODE7 Development Studios
+description: Independent physical animal-carcass storage for NODE7 owned wagons.
+
+resources:
+  - resource: ox_lib
+  - resource: ox_target
+  - resource: oxmysql
+  - resource: node7-core
+  - resource: node7-menu
+  - resource: node7-hunting
+  - resource: node7-wagons
+  - resource: node7-wagon-carcasses
+
+sql:
+  - recipe/node7-wagon-carcasses.sql
+
+config:
+  - recipe/permissions.cfg
+  - recipe/start-order.cfg
