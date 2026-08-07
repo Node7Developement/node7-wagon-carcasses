@@ -1,6 +1,6 @@
 Config = {}
 
-Config.Version = '1.0.5'
+Config.Version = '2.0.1'
 Config.Debug = false
 
 Config.Interaction = {
@@ -37,24 +37,11 @@ Config.HiddenStorage = {
     resecureInterval = 1000,
 }
 
--- Capacity is intentionally separate from node7-inventory storage.
--- Each entry is one physical animal carcass.
-Config.DefaultCapacity = 4
-Config.WagonCapacity = {
-    cart01 = 2,
-    cart02 = 3,
-    cart03 = 4,
-    cart04 = 4,
-    cart05 = 5,
-    cart06 = 6,
-    cart07 = 8,
-    cart08 = 10,
-    coach2 = 2,
-    coach3 = 2,
-    coach4 = 3,
-    coach5 = 3,
-    coach6 = 4,
-}
+-- Carcass storage is database-backed and intentionally unlimited. Physical
+-- carcass entities are consumed when stored and recreated only when unloaded.
+-- This avoids engine entity limits and stale invisible carcasses after restarts.
+Config.UnlimitedStorage = true
+Config.StorageMode = 'virtual'
 
 -- Normalized wagon-space layout. The client scales these positions using the
 -- current wagon model dimensions, so carts and wagons do not need hard-coded

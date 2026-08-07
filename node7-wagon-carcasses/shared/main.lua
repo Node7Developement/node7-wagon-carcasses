@@ -76,9 +76,10 @@ function Node7Carcasses.IsAnimalModel(modelHash)
     return Node7Carcasses.GetAnimalProfile(modelHash) ~= nil
 end
 
-function Node7Carcasses.GetCapacity(modelName)
-    modelName = tostring(modelName or ''):lower()
-    return tonumber((Config.WagonCapacity or {})[modelName]) or tonumber(Config.DefaultCapacity) or 4
+function Node7Carcasses.GetCapacity(_)
+    -- Kept as a compatibility export for older integrations. This resource no
+    -- longer enforces a physical carcass limit.
+    return math.huge
 end
 
 function Node7Carcasses.SafeDecode(value)

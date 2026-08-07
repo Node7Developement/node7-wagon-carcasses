@@ -1,7 +1,7 @@
 name: node7-wagon-carcasses
-version: 1.0.5
+version: 2.0.1
 author: NODE7 Development Studios
-description: Independent physical animal-carcass storage for NODE7 owned wagons.
+description: Unlimited persistent animal-carcass storage for NODE7 owned wagons.
 
 resources:
   - resource: ox_lib

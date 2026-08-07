@@ -6,7 +6,7 @@ rdr3_warning 'I acknowledge that this is a prerelease build of RedM, and I am aw
 name 'node7-wagon-carcasses'
 author 'NODE7 Development Studios'
 description 'Independent physical animal-carcass storage for NODE7 owned wagons.'
-version '1.0.5'
+version '2.0.1'
 
 lua54 'yes'
 

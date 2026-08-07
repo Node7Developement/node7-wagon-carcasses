@@ -1,3 +1,18 @@
+# 2.0.1
+
+- Fixed recreated animal carcasses rendering invisible after resource or full-server restarts.
+- Applies RedM metaped outfit initialization before the recreated animal is killed.
+- Replicates a world-carcass visibility state so every streaming client rebuilds the animal appearance.
+- Added a low-frequency tracked-entity visibility guard for network-owner migration and stale alpha state.
+
+# 2.0.0
+
+- Removed all per-wagon carcass capacity limits.
+- Converted storage to unlimited database-backed records.
+- Consumes the world carcass only after the server reserves the record.
+- Recreates a fresh visible carcass on unload.
+- Clears stale network IDs and legacy hidden entities after restarts.
+
 # Versions
 
 ## 1.0.5

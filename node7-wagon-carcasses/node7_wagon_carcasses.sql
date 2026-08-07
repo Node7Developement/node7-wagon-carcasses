@@ -1,3 +1,4 @@
+-- NODE7 wagon carcasses v2.0.1: unlimited database-backed carcass records.
 CREATE TABLE IF NOT EXISTS `node7_wagon_carcasses` (
     `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     `wagonid` VARCHAR(16) NOT NULL,

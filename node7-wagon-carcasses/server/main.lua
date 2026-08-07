@@ -1,6 +1,7 @@
 local Node7Core = exports['node7-core']:GetCoreObject()
 local RestoreLocks = {}
 local PendingUnloads = {}
+local LoadLocks = {}
 
 local function debugPrint(message)
     if Config.Debug then
@@ -210,25 +211,39 @@ local function createSchema()
     ]])
 end
 
-local function findFreeSlot(wagonid, capacity)
+local function findFreeSlot(wagonid)
     local rows = MySQL.query.await(
         'SELECT `slot` FROM `node7_wagon_carcasses` WHERE `wagonid` = ? ORDER BY `slot` ASC',
         { wagonid }
     ) or {}
 
     local used = {}
-    for _, row in ipairs(rows) do used[tonumber(row.slot)] = true end
-
-    for slot = 1, capacity do
-        if not used[slot] then return slot end
+    for _, row in ipairs(rows) do
+        local slot = tonumber(row.slot)
+        if slot and slot > 0 then used[slot] = true end
     end
 
-    return nil
+    local slot = 1
+    while used[slot] do slot = slot + 1 end
+    return slot
+end
+
+local function acquireLoadLock(wagonid)
+    while LoadLocks[wagonid] do Wait(0) end
+    LoadLocks[wagonid] = true
+end
+
+local function releaseLoadLock(wagonid)
+    LoadLocks[wagonid] = nil
 end
 
 CreateThread(function()
     while GetResourceState('oxmysql') ~= 'started' do Wait(250) end
     createSchema()
+
+    -- Network IDs never survive a resource or full server restart. Stored
+    -- records remain valid, but no physical hidden entity is restored.
+    MySQL.update.await('UPDATE `node7_wagon_carcasses` SET `live_net_id` = 0')
 
     local loadTimeout = math.max(30, math.floor(tonumber(Config.PendingLoadTimeoutSeconds) or 90))
     local unloadTimeout = math.max(30, math.floor(tonumber(Config.PendingUnloadTimeoutSeconds) or 45))
@@ -315,13 +330,6 @@ RegisterNetEvent('node7-wagon-carcasses:server:reserveLoad', function(payload)
         return
     end
 
-    local capacity = Node7Carcasses.GetCapacity(wagon.model)
-    local slot = findFreeSlot(wagonid, capacity)
-    if not slot then
-        notify(source, ('This wagon is full (%s carcasses).'):format(capacity), 'error')
-        return
-    end
-
     local profile = Node7Carcasses.GetAnimalProfile(animalModel)
     if not profile then
         notify(source, 'That animal is blacklisted from carcass storage.', 'error')
@@ -329,25 +337,34 @@ RegisterNetEvent('node7-wagon-carcasses:server:reserveLoad', function(payload)
     end
 
     local loader = citizenId(source)
-    local recordId = MySQL.insert.await([[
-        INSERT INTO `node7_wagon_carcasses`
-            (`wagonid`, `owner_citizenid`, `loaded_by`, `animal_model`, `animal_model_name`,
-             `label`, `group_name`, `slot`, `live_net_id`, `status`)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_load')
-    ]], {
-        wagonid,
-        tostring(wagon.citizenid),
-        loader,
-        animalModel,
-        profile.modelName,
-        profile.label,
-        profile.group,
-        slot,
-        carcassNetId,
-    })
+    acquireLoadLock(wagonid)
+
+    local slot = findFreeSlot(wagonid)
+    local recordId
+    local insertOk, insertResult = pcall(function()
+        return MySQL.insert.await([[
+            INSERT INTO `node7_wagon_carcasses`
+                (`wagonid`, `owner_citizenid`, `loaded_by`, `animal_model`, `animal_model_name`,
+                 `label`, `group_name`, `slot`, `live_net_id`, `status`)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_load')
+        ]], {
+            wagonid,
+            tostring(wagon.citizenid),
+            loader,
+            animalModel,
+            profile.modelName,
+            profile.label,
+            profile.group,
+            slot,
+            carcassNetId,
+        })
+    end)
+    if insertOk then recordId = insertResult end
+
+    releaseLoadLock(wagonid)
 
     if not recordId then
-        notify(source, 'The wagon slot could not be reserved.', 'error')
+        notify(source, 'The carcass storage record could not be reserved.', 'error')
         return
     end
 
@@ -363,38 +380,21 @@ RegisterNetEvent('node7-wagon-carcasses:server:reserveLoad', function(payload)
     })
 end)
 
-RegisterNetEvent('node7-wagon-carcasses:server:confirmLoaded', function(recordId, liveNetId)
+RegisterNetEvent('node7-wagon-carcasses:server:confirmLoaded', function(recordId)
     local source = source
     local loader = citizenId(source)
     recordId = tonumber(recordId)
-    liveNetId = tonumber(liveNetId) or 0
-    if not loader or not recordId or liveNetId == 0 then return end
+    if not loader or not recordId then return end
 
-    local record = MySQL.single.await([[
-        SELECT `id`, `wagonid`, `animal_model`, `loaded_by`, `status`
-        FROM `node7_wagon_carcasses`
-        WHERE `id` = ?
-        LIMIT 1
-    ]], { recordId })
-
-    if not record or tostring(record.loaded_by) ~= loader or record.status ~= 'pending_load' then return end
-
-    local carcass = validateCarcassEntity(liveNetId, tonumber(record.animal_model), source, true)
-    if not carcass then
-        MySQL.query.await('DELETE FROM `node7_wagon_carcasses` WHERE `id` = ? AND `status` = ?', {
-            recordId, 'pending_load'
-        })
-        notify(source, 'The carcass attachment could not be verified.', 'error')
-        return
-    end
-
-    MySQL.update.await([[
+    local changed = MySQL.update.await([[
         UPDATE `node7_wagon_carcasses`
-        SET `live_net_id` = ?, `status` = 'loaded'
-        WHERE `id` = ? AND `status` = 'pending_load'
-    ]], { liveNetId, recordId })
+        SET `live_net_id` = 0, `status` = 'loaded'
+        WHERE `id` = ? AND `loaded_by` = ? AND `status` = 'pending_load'
+    ]], { recordId, loader })
 
-    notify(source, 'Carcass loaded onto the wagon.', 'success')
+    if changed and changed > 0 then
+        notify(source, 'Carcass stored in the wagon.', 'success')
+    end
 end)
 
 RegisterNetEvent('node7-wagon-carcasses:server:loadFailed', function(recordId, reason)
@@ -548,6 +548,11 @@ RegisterNetEvent('node7-wagon-carcasses:server:requestRestore', function(wagonid
     local lock = RestoreLocks[wagonid]
     if lock and lock.expires > now and lock.source ~= source then return end
     RestoreLocks[wagonid] = { source = source, expires = now + 8 }
+
+    MySQL.update.await(
+        'UPDATE `node7_wagon_carcasses` SET `live_net_id` = 0 WHERE `wagonid` = ?',
+        { wagonid }
+    )
 
     local records = MySQL.query.await([[
         SELECT `id`, `wagonid`, `animal_model` AS `model`, `animal_model_name`,

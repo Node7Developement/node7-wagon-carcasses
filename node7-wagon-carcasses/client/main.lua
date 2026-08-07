@@ -6,11 +6,57 @@ local RestoreRequested = {}
 local CurrentMenus = {}
 local CarryCache = { entity = 0, model = 0, lastSeen = 0 }
 local UnloadingEntities = {}
+local WorldCarcasses = {}
+
+local SET_RANDOM_OUTFIT_VARIATION = 0x283978A15512B2FE
+local UPDATE_PED_VARIATION = 0xCC8CA3E88256E58F
 
 local function debugPrint(message)
     if Config.Debug then
         print(('[node7-wagon-carcasses] %s'):format(tostring(message)))
     end
+end
+
+-- RedM animal peds need a metaped outfit/variation build after CreatePed.
+-- Without this, the entity exists and collides but renders completely invisible.
+local function buildAnimalAppearance(entity)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return false end
+
+    pcall(function()
+        Citizen.InvokeNative(SET_RANDOM_OUTFIT_VARIATION, entity, true)
+    end)
+    pcall(function()
+        Citizen.InvokeNative(UPDATE_PED_VARIATION, entity, false, true, true, true, false)
+    end)
+
+    return true
+end
+
+local function forceWorldCarcassVisible(entity)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return false end
+
+    pcall(function() ResetEntityAlpha(entity) end)
+    pcall(function() SetEntityAlpha(entity, 255, false) end)
+    pcall(function() SetEntityVisible(entity, true, false) end)
+    pcall(function() SetEntityCollision(entity, true, true) end)
+    pcall(function() SetEntityHasGravity(entity, true) end)
+    pcall(function() SetEntityDynamic(entity, true) end)
+    pcall(function() SetEntityInvincible(entity, false) end)
+    pcall(function() SetEntityCanBeDamaged(entity, true) end)
+    pcall(function() SetPedCanRagdoll(entity, true) end)
+    pcall(function() FreezeEntityPosition(entity, false) end)
+
+    return true
+end
+
+local function markWorldCarcass(entity)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return end
+
+    WorldCarcasses[entity] = true
+    pcall(function()
+        Entity(entity).state:set('node7CarcassHidden', false, true)
+        Entity(entity).state:set('node7CarcassWorldVisible', true, true)
+    end)
 end
 
 local function notify(message, kind)
@@ -318,10 +364,12 @@ end
 
 local function clearCarcassState(entity)
     if not entity or entity == 0 or not DoesEntityExist(entity) then return end
+    WorldCarcasses[entity] = nil
     pcall(function()
         -- Replicate an explicit false first. Clearing the key directly could
         -- leave a streamed client holding the previous true value.
         Entity(entity).state:set('node7CarcassHidden', false, true)
+        Entity(entity).state:set('node7CarcassWorldVisible', nil, true)
         Entity(entity).state:set('node7CarcassRecord', nil, true)
         Entity(entity).state:set('node7CarcassWagonId', nil, true)
     end)
@@ -414,17 +462,8 @@ local function restoreUnloadedCarcass(entity)
     UnloadingEntities[entity] = GetGameTimer() + 4000
     setStoredPhysics(entity, false)
     setStoredVisibility(entity, false)
-
-    pcall(function() SetEntityAlpha(entity, 255, false) end)
-    pcall(function() ResetEntityAlpha(entity) end)
-    pcall(function() SetEntityVisible(entity, true, false) end)
-    pcall(function() SetEntityCollision(entity, true, true) end)
-    pcall(function() SetEntityHasGravity(entity, true) end)
-    pcall(function() SetEntityDynamic(entity, true) end)
-    pcall(function() SetEntityInvincible(entity, false) end)
-    pcall(function() SetEntityCanBeDamaged(entity, true) end)
-    pcall(function() SetPedCanRagdoll(entity, true) end)
-    pcall(function() FreezeEntityPosition(entity, false) end)
+    buildAnimalAppearance(entity)
+    forceWorldCarcassVisible(entity)
 end
 
 if type(AddStateBagChangeHandler) == 'function' and type(GetEntityFromStateBagName) == 'function' then
@@ -467,7 +506,52 @@ if type(AddStateBagChangeHandler) == 'function' and type(GetEntityFromStateBagNa
     AddStateBagChangeHandler('node7CarcassHidden', nil, function(bagName, _, value)
         applyHiddenStateBag(bagName, value, 0)
     end)
+
+    AddStateBagChangeHandler('node7CarcassWorldVisible', nil, function(bagName, _, value)
+        if value ~= true then return end
+
+        CreateThread(function()
+            for _ = 1, 16 do
+                local entity = GetEntityFromStateBagName(bagName)
+                if entity and entity ~= 0 and DoesEntityExist(entity) then
+                    WorldCarcasses[entity] = true
+                    buildAnimalAppearance(entity)
+                    forceWorldCarcassVisible(entity)
+
+                    -- Metaped components can finish streaming a few frames after
+                    -- the entity itself. Reassert once after the build completes.
+                    Wait(150)
+                    if DoesEntityExist(entity) then
+                        buildAnimalAppearance(entity)
+                        forceWorldCarcassVisible(entity)
+                    end
+                    return
+                end
+                Wait(125)
+            end
+        end)
+    end)
 end
+
+-- Only tracked unloaded carcasses are touched. This keeps visibility intact if
+-- network ownership migrates or RedM reapplies a stale alpha state.
+CreateThread(function()
+    while true do
+        Wait(750)
+        for entity in pairs(WorldCarcasses) do
+            if not DoesEntityExist(entity) then
+                WorldCarcasses[entity] = nil
+            else
+                local ok, state = pcall(function() return Entity(entity).state end)
+                if ok and state and state.node7CarcassWorldVisible == true then
+                    forceWorldCarcassVisible(entity)
+                else
+                    WorldCarcasses[entity] = nil
+                end
+            end
+        end
+    end
+end)
 
 local function releaseCarcassFromPlayer(entity, wagon, transform)
     local playerPed = PlayerPedId()
@@ -839,13 +923,75 @@ local function createDeadAnimal(model, coords, heading)
 
     SetEntityAsMissionEntity(ped, true, true)
     pcall(function() NetworkRegisterEntityAsNetworked(ped) end)
+    ensureNetworkId(ped)
+
+    -- Build the animal metaped before killing it. A newly-created RedM animal
+    -- has no rendered outfit/components until this native initialization runs.
+    buildAnimalAppearance(ped)
+    forceWorldCarcassVisible(ped)
+    Wait(150)
+    buildAnimalAppearance(ped)
+    forceWorldCarcassVisible(ped)
+
     pcall(function() SetEntityHealth(ped, 0) end)
     pcall(function() ApplyDamageToPed(ped, 9999, false, true, true) end)
     pcall(function() SetPedToRagdoll(ped, 1000, 1000, 0, false, false, false) end)
     Wait(100)
 
+    forceWorldCarcassVisible(ped)
+    markWorldCarcass(ped)
+
     SetModelAsNoLongerNeeded(model)
     return ped
+end
+
+local function deleteStoredEntity(entity)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return true end
+    requestControl(entity, 40)
+    clearCarcassState(entity)
+    pcall(function() DetachEntity(entity, true, true) end)
+    pcall(function() SetEntityAsMissionEntity(entity, true, true) end)
+    if type(DeletePed) == 'function' then pcall(function() DeletePed(entity) end) end
+    if DoesEntityExist(entity) then pcall(function() DeleteEntity(entity) end) end
+
+    local timeout = GetGameTimer() + 2500
+    while DoesEntityExist(entity) and GetGameTimer() < timeout do
+        requestControl(entity, 4)
+        if type(DeletePed) == 'function' then pcall(function() DeletePed(entity) end) end
+        if DoesEntityExist(entity) then pcall(function() DeleteEntity(entity) end) end
+        Wait(50)
+    end
+    return not DoesEntityExist(entity)
+end
+
+local function consumeCarcassForStorage(entity, wagon)
+    if not isValidAnimalCarcass(entity) then return false end
+    if not requestControl(entity, 40) then return false end
+
+    local transform = getSlotTransform(wagon, 1)
+    releaseCarcassFromPlayer(entity, wagon, transform)
+    Wait(50)
+    return deleteStoredEntity(entity)
+end
+
+local function cleanupLegacyStoredEntities()
+    for _, ped in ipairs(enumeratePeds()) do
+        if DoesEntityExist(ped) and not IsPedAPlayer(ped) then
+            local ok, state = pcall(function() return Entity(ped).state end)
+            if ok and state then
+                local recordId = tonumber(state.node7CarcassRecord)
+                local hidden = state.node7CarcassHidden == true
+                if recordId or hidden then
+                    local attached = false
+                    if type(IsEntityAttached) == 'function' then
+                        local attachedOk, result = pcall(IsEntityAttached, ped)
+                        attached = attachedOk and result == true
+                    end
+                    if hidden or attached then deleteStoredEntity(ped) end
+                end
+            end
+        end
+    end
 end
 
 local function wagonState(entity)
@@ -1036,7 +1182,6 @@ RegisterNetEvent('node7-wagon-carcasses:client:attachReserved', function(record)
 
     local wagon = NetworkDoesNetworkIdExist(wagonNetId) and NetworkGetEntityFromNetworkId(wagonNetId) or 0
     local carcass = NetworkDoesNetworkIdExist(carcassNetId) and NetworkGetEntityFromNetworkId(carcassNetId) or 0
-
     if wagon == 0 or carcass == 0 or not DoesEntityExist(wagon) or not DoesEntityExist(carcass) then
         TriggerServerEvent('node7-wagon-carcasses:server:loadFailed', tonumber(record.id), 'entity_missing')
         return
@@ -1047,9 +1192,6 @@ RegisterNetEvent('node7-wagon-carcasses:client:attachReserved', function(record)
         return
     end
 
-    -- The server has already validated this exact network entity. Accept it
-    -- when it remains beside the player and the rear of the selected wagon,
-    -- whether it is still in Rockstar's carry state or was placed down.
     local rear = getWagonRearCoords(wagon)
     local carcassCoords = GetEntityCoords(carcass)
     local closeToPlayer = #(carcassCoords - GetEntityCoords(PlayerPedId())) <= 4.5
@@ -1059,61 +1201,21 @@ RegisterNetEvent('node7-wagon-carcasses:client:attachReserved', function(record)
         return
     end
 
-    requestControl(carcass, 25)
-
-    if attachCarcass(carcass, wagon, record) then
-        local liveNetId = ensureNetworkId(carcass)
-        TriggerServerEvent('node7-wagon-carcasses:server:confirmLoaded', tonumber(record.id), liveNetId)
+    if consumeCarcassForStorage(carcass, wagon) then
+        Managed[tonumber(record.id)] = nil
+        TriggerServerEvent('node7-wagon-carcasses:server:confirmLoaded', tonumber(record.id))
     else
-        local drop = getUnloadCoords(wagon) or GetEntityCoords(PlayerPedId())
-        pcall(function() DetachEntity(carcass, true, true) end)
-        setStoredPhysics(carcass, false)
-        pcall(function() SetEntityCoordsNoOffset(carcass, drop.x, drop.y, drop.z, false, false, false) end)
-        pcall(function() PlaceEntityOnGroundProperly(carcass) end)
-        TriggerServerEvent('node7-wagon-carcasses:server:loadFailed', tonumber(record.id), 'attach_failed')
+        TriggerServerEvent('node7-wagon-carcasses:server:loadFailed', tonumber(record.id), 'consume_failed')
     end
 end)
 
-RegisterNetEvent('node7-wagon-carcasses:client:restore', function(records, wagonid, wagonNetId)
+RegisterNetEvent('node7-wagon-carcasses:client:restore', function(_, _, wagonNetId)
     wagonNetId = tonumber(wagonNetId) or 0
     if wagonNetId == 0 or not NetworkDoesNetworkIdExist(wagonNetId) then return end
 
-    local wagon = NetworkGetEntityFromNetworkId(wagonNetId)
-    if wagon == 0 or not DoesEntityExist(wagon) then return end
-
-    for _, record in ipairs(records or {}) do
-        local entity = findEntityByRecord(record.id)
-
-        if entity == 0 and tonumber(record.live_net_id) and tonumber(record.live_net_id) ~= 0
-            and NetworkDoesNetworkIdExist(tonumber(record.live_net_id)) then
-            local candidate = NetworkGetEntityFromNetworkId(tonumber(record.live_net_id))
-            if candidate ~= 0 and DoesEntityExist(candidate)
-                and GetEntityModel(candidate) == tonumber(record.model)
-                and isValidAnimalCarcass(candidate) then
-                local stateOk, state = pcall(function() return Entity(candidate).state end)
-                if stateOk and state and tonumber(state.node7CarcassRecord) == tonumber(record.id) then
-                    entity = candidate
-                end
-            end
-        end
-
-        if entity == 0 then
-            local spawn = GetEntityCoords(wagon)
-            entity = createDeadAnimal(tonumber(record.model), spawn, GetEntityHeading(wagon))
-        end
-
-        if entity ~= 0 and attachCarcass(entity, wagon, record) then
-            TriggerServerEvent(
-                'node7-wagon-carcasses:server:updateLiveEntity',
-                tonumber(record.id),
-                ensureNetworkId(entity),
-                tostring(wagonid),
-                wagonNetId
-            )
-        end
-
-        Wait(100)
-    end
+    -- Stored carcasses are database records, not hidden physical peds. Clean
+    -- any entities left behind by older versions instead of restoring them.
+    cleanupLegacyStoredEntities()
 end)
 
 RegisterNetEvent('node7-wagon-carcasses:client:unload', function(record, wagonNetId)
@@ -1131,31 +1233,20 @@ RegisterNetEvent('node7-wagon-carcasses:client:unload', function(record, wagonNe
         return
     end
 
-    local entity = findEntityByRecord(record.id)
+    -- Remove any legacy hidden entity from older builds, then always create a
+    -- fresh visible carcass. Network IDs and visibility state do not survive
+    -- resource or server restarts reliably.
+    local legacy = findEntityByRecord(record.id)
+    if legacy ~= 0 then deleteStoredEntity(legacy) end
 
-    if entity == 0 and tonumber(record.live_net_id) and tonumber(record.live_net_id) ~= 0
-        and NetworkDoesNetworkIdExist(tonumber(record.live_net_id)) then
-        local candidate = NetworkGetEntityFromNetworkId(tonumber(record.live_net_id))
-        if candidate ~= 0 and DoesEntityExist(candidate)
-            and GetEntityModel(candidate) == tonumber(record.model)
-            and isValidAnimalCarcass(candidate) then
-            local stateOk, state = pcall(function() return Entity(candidate).state end)
-            if stateOk and state and tonumber(state.node7CarcassRecord) == tonumber(record.id) then
-                entity = candidate
-            end
-        end
+    local spawn = getUnloadCoords(wagon)
+    if not spawn then
+        TriggerServerEvent('node7-wagon-carcasses:server:unloadFailed', tonumber(record.id), 'no_unload_position')
+        return
     end
 
-    local recreated = false
-    if entity == 0 then
-        local spawn = getUnloadCoords(wagon)
-        if not spawn then
-            TriggerServerEvent('node7-wagon-carcasses:server:unloadFailed', tonumber(record.id), 'no_unload_position')
-            return
-        end
-        entity = createDeadAnimal(tonumber(record.model), spawn, GetEntityHeading(wagon))
-        recreated = entity ~= 0
-    end
+    local entity = createDeadAnimal(tonumber(record.model), spawn, GetEntityHeading(wagon))
+    local recreated = entity ~= 0
 
     if entity == 0 or not DoesEntityExist(entity) then
         TriggerServerEvent('node7-wagon-carcasses:server:unloadFailed', tonumber(record.id), 'carcass_missing')
@@ -1177,6 +1268,7 @@ RegisterNetEvent('node7-wagon-carcasses:client:unload', function(record, wagonNe
     Managed[recordId] = nil
     UnloadingEntities[entity] = GetGameTimer() + 4000
     clearCarcassState(entity)
+    markWorldCarcass(entity)
 
     pcall(function() DetachEntity(entity, true, true) end)
     restoreUnloadedCarcass(entity)
@@ -1199,6 +1291,8 @@ end)
 -- Keep only stored carcasses pinned. This sleeps for one second and touches
 -- only records already loaded into a wagon; it does not scan world entities.
 CreateThread(function()
+    if Config.StorageMode == 'virtual' then return end
+
     while true do
         Wait(tonumber((Config.HiddenStorage or {}).resecureInterval) or 1000)
 
@@ -1364,6 +1458,15 @@ local function clearPhysicalForMissingWagon()
     end
 end
 
+CreateThread(function()
+    -- Sweep several times because legacy networked peds may stream in shortly
+    -- after this resource starts or after a full server restart.
+    for _, delay in ipairs({ 500, 1500, 3500, 7000 }) do
+        Wait(delay)
+        cleanupLegacyStoredEntities()
+    end
+end)
+
 RegisterNetEvent('node7-wagons:client:despawn', function()
     SetTimeout(0, clearPhysicalForMissingWagon)
 end)
@@ -1379,6 +1482,10 @@ end)
 AddEventHandler('onResourceStop', function(resourceName)
     if resourceName ~= GetCurrentResourceName() then return end
     for key in pairs(Zones) do removeZone(key) end
+    for _, managed in pairs(Managed) do
+        local entity = tonumber(managed.entity) or 0
+        if entity ~= 0 and DoesEntityExist(entity) then deleteStoredEntity(entity) end
+    end
 end)
 
 exports('GetCarriedAnimalCarcass', function()
