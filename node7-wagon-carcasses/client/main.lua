@@ -7,9 +7,24 @@ local CurrentMenus = {}
 local CarryCache = { entity = 0, model = 0, lastSeen = 0 }
 local UnloadingEntities = {}
 local WorldCarcasses = {}
+local PendingSpawnedUnloads = {}
 
 local SET_RANDOM_OUTFIT_VARIATION = 0x283978A15512B2FE
 local UPDATE_PED_VARIATION = 0xCC8CA3E88256E58F
+local FIX_PED_OUTFIT = 0xAAB86462966168CE
+local IS_ENTITY_FULLY_LOOTED = 0x8DE41E9902E85756
+local SET_ENTITY_FULLY_LOOTED = 0x6BCF5F3D8FFE988D
+local IS_ANIMAL_SKINNED = 0x88A5564B19C15391
+local GET_PED_META_OUTFIT_HASH = 0x30569F348D126A5A
+local EQUIP_META_PED_OUTFIT = 0x1902C4CFCC5BE57C
+local GET_NUM_COMPONENTS_IN_PED = 0x90403E8107B60E81
+local GET_META_PED_ASSET_GUIDS = 0xA9C28516A6DC9D56
+local GET_META_PED_ASSET_TINT = 0xE7998FEC53A33BBE
+local SET_META_PED_TAG = 0xBC6DF00D7A4A6819
+local GET_PED_DAMAGE_CLEANLINESS = 0x88EFFED5FE8B0B4A
+local SET_PED_DAMAGE_CLEANLINESS = 0x7528720101A807A5
+local GET_PED_QUALITY = 0x7BCC6087D130312A
+local SET_PED_QUALITY = 0xCE6B874286D640BB
 
 local function debugPrint(message)
     if Config.Debug then
@@ -32,6 +47,193 @@ local function buildAnimalAppearance(entity)
     return true
 end
 
+local function nativeBool(hash, entity)
+    local ok, value = pcall(function()
+        return Citizen.InvokeNative(hash, entity, Citizen.ResultAsInteger())
+    end)
+    if not ok then
+        ok, value = pcall(function() return Citizen.InvokeNative(hash, entity) end)
+    end
+    return ok and (value == true or tonumber(value) == 1) or false
+end
+
+-- Read-only native check. Skinning, rewards, and pelt handling remain entirely in node7-hunting.
+local function isCarcassSkinned(entity)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return false end
+    return nativeBool(IS_ENTITY_FULLY_LOOTED, entity) or nativeBool(IS_ANIMAL_SKINNED, entity)
+end
+
+local function getPedMetaOutfitHash(entity)
+    local ok, value = pcall(function()
+        return Citizen.InvokeNative(GET_PED_META_OUTFIT_HASH, entity, Citizen.ResultAsInteger())
+    end)
+    return ok and (tonumber(value) or 0) or 0
+end
+
+local function getPedDamageCleanliness(entity)
+    local ok, value = pcall(function()
+        return Citizen.InvokeNative(GET_PED_DAMAGE_CLEANLINESS, entity, Citizen.ResultAsInteger())
+    end)
+    return ok and (tonumber(value) or 0) or 0
+end
+
+local function getPedQuality(entity)
+    local ok, value = pcall(function() return Citizen.InvokeNative(GET_PED_QUALITY, entity) end)
+    if not ok or value == nil then
+        ok, value = pcall(function()
+            return Citizen.InvokeNative(GET_PED_QUALITY, entity, Citizen.ResultAsInteger())
+        end)
+    end
+    return ok and (tonumber(value) or 0) or 0
+end
+
+local function getCarcassMetaTags(entity)
+    local ok, count = pcall(function()
+        return Citizen.InvokeNative(GET_NUM_COMPONENTS_IN_PED, entity, Citizen.ResultAsInteger())
+    end)
+    count = ok and math.min(math.max(tonumber(count) or 0, 0), 96) or 0
+
+    local tags = {}
+    for index = 0, count - 1 do
+        local guidOk, drawable, albedo, normal, material = pcall(function()
+            return Citizen.InvokeNative(
+                GET_META_PED_ASSET_GUIDS,
+                entity,
+                index,
+                Citizen.PointerValueInt(),
+                Citizen.PointerValueInt(),
+                Citizen.PointerValueInt(),
+                Citizen.PointerValueInt()
+            )
+        end)
+        local tintOk, palette, tint0, tint1, tint2 = pcall(function()
+            return Citizen.InvokeNative(
+                GET_META_PED_ASSET_TINT,
+                entity,
+                index,
+                Citizen.PointerValueInt(),
+                Citizen.PointerValueInt(),
+                Citizen.PointerValueInt(),
+                Citizen.PointerValueInt()
+            )
+        end)
+
+        if guidOk and tintOk and drawable ~= nil then
+            tags[#tags + 1] = {
+                drawable = tonumber(drawable) or 0,
+                albedo = tonumber(albedo) or 0,
+                normal = tonumber(normal) or 0,
+                material = tonumber(material) or 0,
+                palette = tonumber(palette) or 0,
+                tint0 = tonumber(tint0) or 0,
+                tint1 = tonumber(tint1) or 0,
+                tint2 = tonumber(tint2) or 0,
+            }
+        end
+    end
+
+    return tags
+end
+
+local function decodeMetaTags(value)
+    if type(value) == 'table' then return value end
+    if type(value) ~= 'string' or value == '' then return {} end
+    local ok, decoded = pcall(json.decode, value)
+    return ok and type(decoded) == 'table' and decoded or {}
+end
+
+local function applyCarcassMetaTags(entity, value)
+    local tags = decodeMetaTags(value)
+    local applied = 0
+    for _, data in ipairs(tags) do
+        if type(data) == 'table' then
+            local ok = pcall(function()
+                Citizen.InvokeNative(
+                    SET_META_PED_TAG,
+                    entity,
+                    tonumber(data.drawable) or 0,
+                    tonumber(data.albedo) or 0,
+                    tonumber(data.normal) or 0,
+                    tonumber(data.material) or 0,
+                    tonumber(data.palette) or 0,
+                    tonumber(data.tint0) or 0,
+                    tonumber(data.tint1) or 0,
+                    tonumber(data.tint2) or 0
+                )
+            end)
+            if ok then applied = applied + 1 end
+        end
+    end
+
+    if applied > 0 then
+        pcall(function() Citizen.InvokeNative(FIX_PED_OUTFIT, entity, false) end)
+        pcall(function() Citizen.InvokeNative(UPDATE_PED_VARIATION, entity, false, true, true, true, false) end)
+    end
+    return applied
+end
+
+local function captureSkinnedCarcass(entity)
+    return {
+        isSkinned = isCarcassSkinned(entity),
+        metaOutfitHash = getPedMetaOutfitHash(entity),
+        metaTags = getCarcassMetaTags(entity),
+        damageCleanliness = getPedDamageCleanliness(entity),
+        quality = getPedQuality(entity),
+    }
+end
+
+local function markWagonProcessedState(entity, sourceRecord)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return end
+    pcall(function()
+        local state = Entity(entity).state
+        state:set('node7WagonCarcassProcessed', true, true)
+        if sourceRecord then state:set('node7CarcassSourceRecord', tonumber(sourceRecord), true) end
+    end)
+end
+
+local function applySkinnedCarcassState(entity, record)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return false end
+    record = type(record) == 'table' and record or {}
+
+    local outfit = tonumber(record.meta_outfit_hash or record.metaOutfitHash) or 0
+    local damage = tonumber(record.damage_cleanliness or record.damageCleanliness) or 0
+    local quality = tonumber(record.quality) or 0
+    local tags = record.meta_tags or record.metaTags
+
+    for _ = 1, 5 do
+        pcall(function() Citizen.InvokeNative(SET_ENTITY_FULLY_LOOTED, entity, true) end)
+
+        local tagCount = applyCarcassMetaTags(entity, tags)
+        if tagCount == 0 and outfit ~= 0 then
+            pcall(function() Citizen.InvokeNative(EQUIP_META_PED_OUTFIT, entity, outfit) end)
+            pcall(function() Citizen.InvokeNative(FIX_PED_OUTFIT, entity, false) end)
+            pcall(function() Citizen.InvokeNative(UPDATE_PED_VARIATION, entity, false, true, true, true, false) end)
+        end
+
+        pcall(function() Citizen.InvokeNative(SET_PED_DAMAGE_CLEANLINESS, entity, damage) end)
+        pcall(function() Citizen.InvokeNative(SET_PED_QUALITY, entity, quality) end)
+        pcall(function() Citizen.InvokeNative(SET_ENTITY_FULLY_LOOTED, entity, true) end)
+        markWagonProcessedState(entity, record.id)
+
+        Wait(200)
+        if isCarcassSkinned(entity) then return true end
+    end
+
+    return false
+end
+
+local function refreshWorldCarcassAppearance(entity)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return end
+    local ok, state = pcall(function() return Entity(entity).state end)
+    if ok and state and state.node7WagonCarcassProcessed == true then
+        pcall(function() Citizen.InvokeNative(SET_ENTITY_FULLY_LOOTED, entity, true) end)
+        pcall(function() Citizen.InvokeNative(FIX_PED_OUTFIT, entity, false) end)
+        pcall(function() Citizen.InvokeNative(UPDATE_PED_VARIATION, entity, false, true, true, true, false) end)
+    else
+        buildAnimalAppearance(entity)
+    end
+end
+
 local function forceWorldCarcassVisible(entity)
     if not entity or entity == 0 or not DoesEntityExist(entity) then return false end
 
@@ -49,13 +251,18 @@ local function forceWorldCarcassVisible(entity)
     return true
 end
 
-local function markWorldCarcass(entity)
+local function markWorldCarcass(entity, skinned, sourceRecord)
     if not entity or entity == 0 or not DoesEntityExist(entity) then return end
 
     WorldCarcasses[entity] = true
     pcall(function()
-        Entity(entity).state:set('node7CarcassHidden', false, true)
-        Entity(entity).state:set('node7CarcassWorldVisible', true, true)
+        local state = Entity(entity).state
+        state:set('node7CarcassHidden', false, true)
+        state:set('node7CarcassWorldVisible', true, true)
+        if skinned == true then
+            state:set('node7WagonCarcassProcessed', true, true)
+        end
+        if sourceRecord then state:set('node7CarcassSourceRecord', tonumber(sourceRecord), true) end
     end)
 end
 
@@ -233,8 +440,8 @@ local function getCarriedEntity()
     end)
     entity = ok and tonumber(entity) or 0
 
-    -- Match the working node7-hunting path as a fallback for runtimes that
-    -- already coerce entity return values without an explicit result marker.
+    -- Fallback for runtimes that coerce entity return values without an
+    -- explicit result marker. This resource does not call hunting logic.
     if entity == 0 then
         local fallbackOk, fallback = pcall(function()
             return Citizen.InvokeNative(0xD806CD2A4F2C2996, playerPed)
@@ -462,7 +669,7 @@ local function restoreUnloadedCarcass(entity)
     UnloadingEntities[entity] = GetGameTimer() + 4000
     setStoredPhysics(entity, false)
     setStoredVisibility(entity, false)
-    buildAnimalAppearance(entity)
+    refreshWorldCarcassAppearance(entity)
     forceWorldCarcassVisible(entity)
 end
 
@@ -515,16 +722,31 @@ if type(AddStateBagChangeHandler) == 'function' and type(GetEntityFromStateBagNa
                 local entity = GetEntityFromStateBagName(bagName)
                 if entity and entity ~= 0 and DoesEntityExist(entity) then
                     WorldCarcasses[entity] = true
-                    buildAnimalAppearance(entity)
+                    refreshWorldCarcassAppearance(entity)
                     forceWorldCarcassVisible(entity)
 
                     -- Metaped components can finish streaming a few frames after
                     -- the entity itself. Reassert once after the build completes.
                     Wait(150)
                     if DoesEntityExist(entity) then
-                        buildAnimalAppearance(entity)
+                        refreshWorldCarcassAppearance(entity)
                         forceWorldCarcassVisible(entity)
                     end
+                    return
+                end
+                Wait(125)
+            end
+        end)
+    end)
+
+
+    AddStateBagChangeHandler('node7WagonCarcassProcessed', nil, function(bagName, _, value)
+        if value ~= true then return end
+        CreateThread(function()
+            for _ = 1, 12 do
+                local entity = GetEntityFromStateBagName(bagName)
+                if entity and entity ~= 0 and DoesEntityExist(entity) then
+                    pcall(function() Citizen.InvokeNative(SET_ENTITY_FULLY_LOOTED, entity, true) end)
                     return
                 end
                 Wait(125)
@@ -903,9 +1125,14 @@ local function findEntityByRecord(recordId)
     return 0
 end
 
-local function createDeadAnimal(model, coords, heading)
+local function createDeadAnimal(model, coords, heading, record)
     model = tonumber(model) or 0
     if model == 0 or not Node7Carcasses.IsAnimalModel(model) then return 0 end
+
+    record = type(record) == 'table' and record or {}
+    local shouldBeSkinned = tonumber(record.is_skinned) == 1
+        or record.is_skinned == true
+        or record.isSkinned == true
 
     RequestModel(model)
     local timeout = GetGameTimer() + 10000
@@ -925,21 +1152,81 @@ local function createDeadAnimal(model, coords, heading)
     pcall(function() NetworkRegisterEntityAsNetworked(ped) end)
     ensureNetworkId(ped)
 
-    -- Build the animal metaped before killing it. A newly-created RedM animal
-    -- has no rendered outfit/components until this native initialization runs.
-    buildAnimalAppearance(ped)
-    forceWorldCarcassVisible(ped)
-    Wait(150)
-    buildAnimalAppearance(ped)
-    forceWorldCarcassVisible(ped)
+    -- Keep the replacement hidden until its stored metaped snapshot and
+    -- processed state have both been restored. This prevents a one-frame
+    -- intact animal flash and prevents players interacting before commit.
+    pcall(function() SetEntityVisible(ped, false, false) end)
+    pcall(function() SetEntityAlpha(ped, 0, false) end)
+    pcall(function() SetEntityCollision(ped, false, false) end)
+    pcall(function() FreezeEntityPosition(ped, true) end)
+
+    if shouldBeSkinned then
+        local outfit = tonumber(record.meta_outfit_hash or record.metaOutfitHash) or 0
+        local tags = record.meta_tags or record.metaTags
+        local decodedTags = decodeMetaTags(tags)
+        local applied = 0
+
+        -- Do not build a fresh random animal first when an exact snapshot is
+        -- available. Starting from the blank metaped and applying every stored
+        -- component preserves components removed by skinning instead of leaving
+        -- an intact hide underneath the restored snapshot.
+        if #decodedTags > 0 then
+            applied = applyCarcassMetaTags(ped, decodedTags)
+            Wait(200)
+            if applied > 0 then applyCarcassMetaTags(ped, decodedTags) end
+        end
+
+        -- Compatibility fallback for legacy records created before component
+        -- snapshots existed. These remain fully looted to prevent duplication,
+        -- even when only their old outfit hash is available.
+        if applied == 0 then
+            buildAnimalAppearance(ped)
+            Wait(150)
+            if outfit ~= 0 then
+                pcall(function() Citizen.InvokeNative(EQUIP_META_PED_OUTFIT, ped, outfit) end)
+                pcall(function() Citizen.InvokeNative(FIX_PED_OUTFIT, ped, false) end)
+                pcall(function() Citizen.InvokeNative(UPDATE_PED_VARIATION, ped, false, true, true, true, false) end)
+            end
+        end
+
+        pcall(function()
+            Citizen.InvokeNative(SET_PED_DAMAGE_CLEANLINESS, ped, tonumber(record.damage_cleanliness or record.damageCleanliness) or 0)
+        end)
+        pcall(function()
+            Citizen.InvokeNative(SET_PED_QUALITY, ped, tonumber(record.quality) or 0)
+        end)
+    else
+        buildAnimalAppearance(ped)
+        Wait(150)
+    end
 
     pcall(function() SetEntityHealth(ped, 0) end)
     pcall(function() ApplyDamageToPed(ped, 9999, false, true, true) end)
     pcall(function() SetPedToRagdoll(ped, 1000, 1000, 0, false, false, false) end)
-    Wait(100)
+    Wait(200)
 
+    if shouldBeSkinned then
+        -- Fully-looted is the authoritative anti-duplication state. The exact
+        -- skinned metaped snapshot is visual; this native blocks a fresh skin/
+        -- loot cycle even after network ownership changes.
+        for _ = 1, 3 do
+            pcall(function() Citizen.InvokeNative(SET_ENTITY_FULLY_LOOTED, ped, true) end)
+            markWagonProcessedState(ped, record.id)
+            Wait(75)
+        end
+
+        if not nativeBool(IS_ENTITY_FULLY_LOOTED, ped) then
+            pcall(function() SetEntityAsMissionEntity(ped, true, true) end)
+            if type(DeletePed) == 'function' then pcall(function() DeletePed(ped) end) end
+            if DoesEntityExist(ped) then pcall(function() DeleteEntity(ped) end) end
+            SetModelAsNoLongerNeeded(model)
+            return 0
+        end
+    end
+
+    pcall(function() FreezeEntityPosition(ped, false) end)
     forceWorldCarcassVisible(ped)
-    markWorldCarcass(ped)
+    markWorldCarcass(ped, shouldBeSkinned, record.id)
 
     SetModelAsNoLongerNeeded(model)
     return ped
@@ -1055,8 +1342,8 @@ local function openCarcassMenu(records, wagonid, networkId, wagonEntity)
 
         items[#items + 1] = {
             header = header,
-            txt = ('Type: %s | Wagon slot: %s'):format(group, slot),
-            badge = 'STORED',
+            txt = ('Type: %s | Wagon slot: %s | Processed'):format(group, slot),
+            badge = 'SKINNED',
             submenu = {
                 {
                     header = 'Unload Carcass',
@@ -1105,11 +1392,21 @@ local function loadCarriedIntoWagon(wagon, state)
         return
     end
 
+    local carcassData = captureSkinnedCarcass(carcass)
+    if Config.RequireSkinnedCarcass ~= false and carcassData.isSkinned ~= true then
+        notify('Skin the animal first. This wagon only stores carcasses already processed by your hunting system.', 'error')
+        return
+    end
+
     local carcassNetId = ensureNetworkId(carcass)
     if carcassNetId == 0 or state.networkId == 0 then
         notify('The carried carcass is not network-ready yet. Try Store once more.', 'error')
         return
     end
+
+    -- Wagon-only replication marker used by the server to validate this exact
+    -- storage request. It does not call, alter, or replace node7-hunting.
+    markWagonProcessedState(carcass)
 
     debugPrint(('reserving %s carcass entity=%s net=%s wagon=%s'):format(
         wasCarried and 'carried' or 'ground', carcass, carcassNetId, state.wagonid
@@ -1121,6 +1418,11 @@ local function loadCarriedIntoWagon(wagon, state)
         carcassNetId = carcassNetId,
         animalModel = GetEntityModel(carcass),
         wasCarried = wasCarried == true,
+        isSkinned = carcassData.isSkinned == true,
+        metaOutfitHash = carcassData.metaOutfitHash,
+        metaTags = carcassData.metaTags,
+        damageCleanliness = carcassData.damageCleanliness,
+        quality = carcassData.quality,
     })
 end
 
@@ -1245,7 +1547,7 @@ RegisterNetEvent('node7-wagon-carcasses:client:unload', function(record, wagonNe
         return
     end
 
-    local entity = createDeadAnimal(tonumber(record.model), spawn, GetEntityHeading(wagon))
+    local entity = createDeadAnimal(tonumber(record.model), spawn, GetEntityHeading(wagon), record)
     local recreated = entity ~= 0
 
     if entity == 0 or not DoesEntityExist(entity) then
@@ -1268,7 +1570,7 @@ RegisterNetEvent('node7-wagon-carcasses:client:unload', function(record, wagonNe
     Managed[recordId] = nil
     UnloadingEntities[entity] = GetGameTimer() + 4000
     clearCarcassState(entity)
-    markWorldCarcass(entity)
+    markWorldCarcass(entity, true, recordId)
 
     pcall(function() DetachEntity(entity, true, true) end)
     restoreUnloadedCarcass(entity)
@@ -1285,7 +1587,36 @@ RegisterNetEvent('node7-wagon-carcasses:client:unload', function(record, wagonNe
         end)
     end
 
-    TriggerServerEvent('node7-wagon-carcasses:server:confirmUnloaded', recordId, recreated == true)
+    local spawnedNetId = ensureNetworkId(entity)
+    PendingSpawnedUnloads[recordId] = { entity = entity }
+    TriggerServerEvent('node7-wagon-carcasses:server:confirmUnloaded', recordId, spawnedNetId)
+
+    -- A missing server acknowledgement must never leave both a world carcass
+    -- and a stored database record. Roll the world entity back safely.
+    SetTimeout(12000, function()
+        local pending = PendingSpawnedUnloads[recordId]
+        if not pending then return end
+        PendingSpawnedUnloads[recordId] = nil
+        local pendingEntity = tonumber(pending.entity) or 0
+        if pendingEntity ~= 0 and DoesEntityExist(pendingEntity) then
+            deleteStoredEntity(pendingEntity)
+        end
+        TriggerServerEvent('node7-wagon-carcasses:server:unloadFailed', recordId, 'commit_timeout')
+    end)
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:client:unloadCommitted', function(recordId)
+    PendingSpawnedUnloads[tonumber(recordId)] = nil
+end)
+
+RegisterNetEvent('node7-wagon-carcasses:client:unloadRollback', function(recordId)
+    recordId = tonumber(recordId)
+    local pending = recordId and PendingSpawnedUnloads[recordId] or nil
+    PendingSpawnedUnloads[recordId] = nil
+    local entity = pending and tonumber(pending.entity) or 0
+    if entity ~= 0 and DoesEntityExist(entity) then
+        deleteStoredEntity(entity)
+    end
 end)
 
 -- Keep only stored carcasses pinned. This sleeps for one second and touches
@@ -1484,6 +1815,11 @@ AddEventHandler('onResourceStop', function(resourceName)
     for key in pairs(Zones) do removeZone(key) end
     for _, managed in pairs(Managed) do
         local entity = tonumber(managed.entity) or 0
+        if entity ~= 0 and DoesEntityExist(entity) then deleteStoredEntity(entity) end
+    end
+    for _, pending in pairs(PendingSpawnedUnloads) do
+        local entity = type(pending) == 'table' and tonumber(pending.entity) or tonumber(pending)
+        entity = entity or 0
         if entity ~= 0 and DoesEntityExist(entity) then deleteStoredEntity(entity) end
     end
 end)

@@ -1,5 +1,5 @@
 name: node7-wagon-carcasses
-version: 2.0.1
+version: 2.1.1
 author: NODE7 Development Studios
 description: Unlimited persistent animal-carcass storage for NODE7 owned wagons.
 
@@ -9,7 +9,6 @@ resources:
   - resource: oxmysql
   - resource: node7-core
   - resource: node7-menu
-  - resource: node7-hunting
   - resource: node7-wagons
   - resource: node7-wagon-carcasses
 

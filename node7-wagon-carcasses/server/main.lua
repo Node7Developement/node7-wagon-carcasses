@@ -184,6 +184,40 @@ local function validateCarcassEntity(networkId, expectedModel, source, allowCarr
     return entity
 end
 
+local function sanitizeMetaTags(value)
+    if type(value) ~= 'table' then return {} end
+    local clean = {}
+    for index = 1, math.min(#value, 96) do
+        local item = value[index]
+        if type(item) == 'table' then
+            clean[#clean + 1] = {
+                drawable = tonumber(item.drawable) or 0,
+                albedo = tonumber(item.albedo) or 0,
+                normal = tonumber(item.normal) or 0,
+                material = tonumber(item.material) or 0,
+                palette = tonumber(item.palette) or 0,
+                tint0 = tonumber(item.tint0) or 0,
+                tint1 = tonumber(item.tint1) or 0,
+                tint2 = tonumber(item.tint2) or 0,
+            }
+        end
+    end
+    return clean
+end
+
+local function ensureColumn(name, definition)
+    local exists = MySQL.scalar.await([[
+        SELECT COUNT(*)
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'node7_wagon_carcasses'
+          AND COLUMN_NAME = ?
+    ]], { name })
+    if tonumber(exists) == 0 then
+        MySQL.query.await(('ALTER TABLE `node7_wagon_carcasses` ADD COLUMN `%s` %s'):format(name, definition))
+    end
+end
+
 local function createSchema()
     MySQL.query.await([[
         CREATE TABLE IF NOT EXISTS `node7_wagon_carcasses` (
@@ -195,6 +229,11 @@ local function createSchema()
             `animal_model_name` VARCHAR(64) NOT NULL,
             `label` VARCHAR(64) NOT NULL,
             `group_name` VARCHAR(32) NOT NULL,
+            `is_skinned` TINYINT(1) NOT NULL DEFAULT 1,
+            `meta_outfit_hash` BIGINT NOT NULL DEFAULT 0,
+            `meta_tags` LONGTEXT NULL,
+            `damage_cleanliness` INT NOT NULL DEFAULT 0,
+            `quality` INT NOT NULL DEFAULT 0,
             `slot` INT UNSIGNED NOT NULL,
             `live_net_id` INT UNSIGNED NOT NULL DEFAULT 0,
             `status` VARCHAR(20) NOT NULL DEFAULT 'loaded',
@@ -209,6 +248,16 @@ local function createSchema()
                 ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     ]])
+
+    ensureColumn('is_skinned', 'TINYINT(1) NOT NULL DEFAULT 1 AFTER `group_name`')
+    ensureColumn('meta_outfit_hash', 'BIGINT NOT NULL DEFAULT 0 AFTER `is_skinned`')
+    ensureColumn('meta_tags', 'LONGTEXT NULL AFTER `meta_outfit_hash`')
+    ensureColumn('damage_cleanliness', 'INT NOT NULL DEFAULT 0 AFTER `meta_tags`')
+    ensureColumn('quality', 'INT NOT NULL DEFAULT 0 AFTER `damage_cleanliness`')
+
+    -- Records created before v2.1.0 did not preserve processing state. Treat
+    -- them as already skinned so legacy data can never produce fresh rewards.
+    MySQL.update.await('UPDATE `node7_wagon_carcasses` SET `is_skinned` = 1 WHERE `is_skinned` <> 1 OR `is_skinned` IS NULL')
 end
 
 local function findFreeSlot(wagonid)
@@ -302,7 +351,17 @@ RegisterNetEvent('node7-wagon-carcasses:server:reserveLoad', function(payload)
     local carcassNetId = tonumber(payload.carcassNetId) or 0
     local animalModel = tonumber(payload.animalModel) or 0
     local wasCarried = payload.wasCarried == true
+    local isSkinned = payload.isSkinned == true
+    local metaOutfitHash = tonumber(payload.metaOutfitHash) or 0
+    local metaTags = sanitizeMetaTags(payload.metaTags)
+    local damageCleanliness = tonumber(payload.damageCleanliness) or 0
+    local quality = tonumber(payload.quality) or 0
     if wagonid == '' or wagonNetId == 0 or carcassNetId == 0 or animalModel == 0 then return end
+
+    if Config.RequireSkinnedCarcass ~= false and not isSkinned then
+        notify(source, 'Skin the animal first. Only carcasses already processed by your hunting system can be stored.', 'error')
+        return
+    end
 
     local wagon, wagonEntity, reason = validateWagonAccess(source, wagonid, wagonNetId)
     if not wagon then
@@ -314,6 +373,22 @@ RegisterNetEvent('node7-wagon-carcasses:server:reserveLoad', function(payload)
     if not carcass then
         notify(source, ('Carcass rejected: %s.'):format(carcassReason), 'error')
         return
+    end
+
+    if Config.RequireSkinnedCarcass ~= false then
+        local processed = false
+        for _ = 1, 10 do
+            local stateOk, carcassState = pcall(function() return Entity(carcass).state end)
+            if stateOk and carcassState and carcassState.node7WagonCarcassProcessed == true then
+                processed = true
+                break
+            end
+            Wait(75)
+        end
+        if not processed then
+            notify(source, 'The processed carcass state could not be verified. Pick it up and try again.', 'error')
+            return
+        end
     end
 
     if not playerNearEntity(source, carcass, 4.0) or not entitiesNear(wagonEntity, carcass, 8.0) then
@@ -345,8 +420,9 @@ RegisterNetEvent('node7-wagon-carcasses:server:reserveLoad', function(payload)
         return MySQL.insert.await([[
             INSERT INTO `node7_wagon_carcasses`
                 (`wagonid`, `owner_citizenid`, `loaded_by`, `animal_model`, `animal_model_name`,
-                 `label`, `group_name`, `slot`, `live_net_id`, `status`)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_load')
+                 `label`, `group_name`, `is_skinned`, `meta_outfit_hash`, `meta_tags`,
+                 `damage_cleanliness`, `quality`, `slot`, `live_net_id`, `status`)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_load')
         ]], {
             wagonid,
             tostring(wagon.citizenid),
@@ -355,6 +431,11 @@ RegisterNetEvent('node7-wagon-carcasses:server:reserveLoad', function(payload)
             profile.modelName,
             profile.label,
             profile.group,
+            isSkinned and 1 or 0,
+            metaOutfitHash,
+            json.encode(metaTags),
+            damageCleanliness,
+            quality,
             slot,
             carcassNetId,
         })
@@ -376,6 +457,11 @@ RegisterNetEvent('node7-wagon-carcasses:server:reserveLoad', function(payload)
         model = animalModel,
         label = profile.label,
         group_name = profile.group,
+        is_skinned = isSkinned and 1 or 0,
+        meta_outfit_hash = metaOutfitHash,
+        meta_tags = json.encode(metaTags),
+        damage_cleanliness = damageCleanliness,
+        quality = quality,
         slot = slot,
     })
 end)
@@ -425,7 +511,8 @@ RegisterNetEvent('node7-wagon-carcasses:server:list', function(wagonid, wagonNet
 
     local records = MySQL.query.await([[
         SELECT `id`, `wagonid`, `animal_model` AS `model`, `animal_model_name`,
-               `label`, `group_name`, `slot`, `live_net_id`, `created_at`
+               `label`, `group_name`, `is_skinned`, `meta_outfit_hash`, `meta_tags`,
+               `damage_cleanliness`, `quality`, `slot`, `live_net_id`, `created_at`
         FROM `node7_wagon_carcasses`
         WHERE `wagonid` = ? AND `status` = 'loaded'
         ORDER BY `slot` ASC
@@ -462,7 +549,8 @@ RegisterNetEvent('node7-wagon-carcasses:server:requestUnload', function(payload)
 
     local record = MySQL.single.await([[
         SELECT `id`, `wagonid`, `animal_model` AS `model`, `animal_model_name`,
-               `label`, `group_name`, `slot`, `live_net_id`
+               `label`, `group_name`, `is_skinned`, `meta_outfit_hash`, `meta_tags`,
+               `damage_cleanliness`, `quality`, `slot`, `live_net_id`
         FROM `node7_wagon_carcasses`
         WHERE `id` = ? AND `wagonid` = ? AND `status` = 'pending_unload'
         LIMIT 1
@@ -475,33 +563,54 @@ RegisterNetEvent('node7-wagon-carcasses:server:requestUnload', function(payload)
         citizenid = citizenId(source),
         wagonid = wagonid,
         wagonNetId = wagonNetId,
+        model = tonumber(record.model) or 0,
         expires = os.time() + math.max(30, math.floor(tonumber(Config.PendingUnloadTimeoutSeconds) or 45)),
     }
 
     TriggerClientEvent('node7-wagon-carcasses:client:unload', source, record, wagonNetId)
 end)
 
-RegisterNetEvent('node7-wagon-carcasses:server:confirmUnloaded', function(recordId, recreated)
+RegisterNetEvent('node7-wagon-carcasses:server:confirmUnloaded', function(recordId, spawnedNetId)
     local source = source
     recordId = tonumber(recordId)
-    if not recordId then return end
+    spawnedNetId = tonumber(spawnedNetId) or 0
+    if not recordId or spawnedNetId == 0 then return end
 
     local pending = PendingUnloads[recordId]
     if not pending
         or tonumber(pending.source) ~= tonumber(source)
         or pending.expires < os.time()
         or tostring(pending.citizenid or '') ~= tostring(citizenId(source) or '') then
+        TriggerClientEvent('node7-wagon-carcasses:client:unloadRollback', source, recordId)
         return
     end
 
-    local record = MySQL.single.await([[
-        SELECT `id`, `wagonid`
-        FROM `node7_wagon_carcasses`
-        WHERE `id` = ? AND `wagonid` = ? AND `status` = 'pending_unload'
-        LIMIT 1
-    ]], { recordId, tostring(pending.wagonid) })
-    if not record then
+    local spawned, wagonEntity, validSpawn
+    for _ = 1, 30 do
+        spawned = getEntity(spawnedNetId)
+        wagonEntity = getEntity(pending.wagonNetId)
+        validSpawn = spawned and wagonEntity
+            and hashEquals(GetEntityModel(spawned), pending.model)
+            and isDeadEntity(spawned)
+            and entitiesNear(spawned, wagonEntity, 10.0)
+
+        if validSpawn then
+            local stateOk, entityState = pcall(function() return Entity(spawned).state end)
+            validSpawn = stateOk and entityState and entityState.node7WagonCarcassProcessed == true
+        end
+        if validSpawn then break end
+        Wait(100)
+    end
+
+    if not validSpawn then
+        MySQL.update.await([[
+            UPDATE `node7_wagon_carcasses`
+            SET `status` = 'loaded'
+            WHERE `id` = ? AND `wagonid` = ? AND `status` = 'pending_unload'
+        ]], { recordId, tostring(pending.wagonid) })
         PendingUnloads[recordId] = nil
+        TriggerClientEvent('node7-wagon-carcasses:client:unloadRollback', source, recordId)
+        notify(source, 'The processed carcass could not be verified and stayed stored.', 'error')
         return
     end
 
@@ -512,7 +621,10 @@ RegisterNetEvent('node7-wagon-carcasses:server:confirmUnloaded', function(record
 
     PendingUnloads[recordId] = nil
     if changed and changed > 0 then
-        notify(source, recreated and 'Carcass restored and placed behind the wagon.' or 'Carcass placed behind the wagon.', 'success')
+        TriggerClientEvent('node7-wagon-carcasses:client:unloadCommitted', source, recordId)
+        notify(source, 'Skinned carcass placed behind the wagon.', 'success')
+    else
+        TriggerClientEvent('node7-wagon-carcasses:client:unloadRollback', source, recordId)
     end
 end)
 
@@ -556,7 +668,8 @@ RegisterNetEvent('node7-wagon-carcasses:server:requestRestore', function(wagonid
 
     local records = MySQL.query.await([[
         SELECT `id`, `wagonid`, `animal_model` AS `model`, `animal_model_name`,
-               `label`, `group_name`, `slot`, `live_net_id`
+               `label`, `group_name`, `is_skinned`, `meta_outfit_hash`, `meta_tags`,
+               `damage_cleanliness`, `quality`, `slot`, `live_net_id`
         FROM `node7_wagon_carcasses`
         WHERE `wagonid` = ? AND `status` = 'loaded'
         ORDER BY `slot` ASC

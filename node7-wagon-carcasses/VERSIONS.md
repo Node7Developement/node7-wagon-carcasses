@@ -1,3 +1,21 @@
+## 2.1.1
+
+- Removed `node7-hunting` as a dependency.
+- Removed all hunting-named state bags and integration markers.
+- Wagon storage now performs only a read-only native processed/skinned check.
+- Skinning animations, rewards, pelts, inventory handling, and harvest claims remain entirely owned by `node7-hunting`.
+- Unloaded carcasses retain their saved skinned appearance and native fully-looted state without invoking hunting code.
+
+# 2.1.0
+
+- Requires carcasses to be skinned/fully looted before storage.
+- Preserves metaped component tags, outfit hash, quality, and damage cleanliness.
+- Restores unloaded animals as fully looted before making them usable in the world.
+- Adds replicated wagon-owned processed-state markers for storage validation.
+- Verifies the replacement network entity before committing an unload.
+- Rolls back an unverified unload instead of duplicating the database record.
+- Migrates legacy records as processed to prevent fresh skinning rewards.
+
 # 2.0.1
 
 - Fixed recreated animal carcasses rendering invisible after resource or full-server restarts.

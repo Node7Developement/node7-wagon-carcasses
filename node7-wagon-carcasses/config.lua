@@ -1,6 +1,6 @@
 Config = {}
 
-Config.Version = '2.0.1'
+Config.Version = '2.1.1'
 Config.Debug = false
 
 Config.Interaction = {
@@ -43,6 +43,11 @@ Config.HiddenStorage = {
 Config.UnlimitedStorage = true
 Config.StorageMode = 'virtual'
 
+-- Read-only storage rule: only carcasses already skinned by the existing
+-- hunting system may enter storage. This resource never performs skinning,
+-- grants rewards, removes pelts, or changes node7-hunting behavior.
+Config.RequireSkinnedCarcass = true
+
 -- Normalized wagon-space layout. The client scales these positions using the
 -- current wagon model dimensions, so carts and wagons do not need hard-coded
 -- world coordinates. x/y/z values are percentages of the model bounds.
@@ -63,8 +68,8 @@ Config.RestoreRequestCooldown = 10000
 Config.PendingLoadTimeoutSeconds = 90
 Config.PendingUnloadTimeoutSeconds = 45
 
--- Strict animal whitelist synchronized with node7-hunting 2.3.0.
--- Human NPC models are not present and cannot enter this system.
+-- Strict animal whitelist for wagon carcass storage. Human NPC models are
+-- not present and cannot enter this system.
 Config.Animals = {
     A_C_ALLIGATOR_01 = { label = 'Alligator', group = 'reptile' },
     A_C_ALLIGATOR_03 = { label = 'Small Alligator', group = 'reptile' },
