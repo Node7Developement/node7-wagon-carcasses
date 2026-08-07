@@ -1,34 +1,21 @@
-[README.md](https://github.com/user-attachments/files/30765389/README.md)
+[README.md](https://github.com/user-attachments/files/30810866/README.md)
 # node7-wagon-carcasses
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-Independent physical animal-carcass storage for NODE7 owned wagons.
+Unlimited persistent animal-carcass storage for NODE7 owned wagons.
 
 ## Behavior
 
 - Human NPCs are strictly blacklisted by an animal-model whitelist.
 - Only dead animal peds can be loaded.
-- Loading uses the exact carcass entity currently carried by the player.
-- The original carcass entity is hidden, collisionless, and locked to a compact rear wagon anchor.
+- Loading uses the exact carcass entity currently carried by the player or placed beside the rear target.
+- After the server reserves the record, the original world carcass is consumed instead of being kept as a hidden network entity.
 - No hunting rewards or inventory items are created by loading or unloading.
 - `Stored Carcasses` opens through `node7-menu`.
 - Selecting a stored animal lets the player unload it onto the ground behind the wagon.
-- During the same live session, unloading detaches the original carcass entity.
-- A carcass is recreated only when the original entity no longer exists after wagon storage, streaming cleanup, or a restart.
+- Unloading always creates a fresh visible dead-animal entity behind the wagon.
+- Resource and full-server restarts preserve database records without restoring stale hidden entities.
 - Carcass records persist independently in `node7_wagon_carcasses`.
-- Wagon ownership, shared keys, lock state, network ID, distance, animal model, death state, and capacity are server validated.
+- Wagon ownership, shared keys, lock state, network ID, distance, animal model, and death state are server validated.
 
 ## Dependencies
 
@@ -54,7 +41,7 @@ The existing `node7-wagons` rear target continues to handle inventory storage an
 
 ## Capacity
 
-Carcass capacity is configured independently in `config.lua`. Normal item-storage slots and weight remain owned by `node7-inventory`.
+Carcass storage is unlimited and database-backed. The physical carcass is consumed when stored and recreated visibly when unloaded, preventing stale invisible entities after resource or server restarts. Normal item-storage slots and weight remain owned by `node7-inventory`.
 
 ## Butcher integration
 
@@ -75,4 +62,16 @@ Version 1.0.2 reads Rockstar's active carry slot, the attached-carriable itemset
 
 ### Physical attachment behavior
 
-Version 1.0.5 keeps the original carcass hidden only while it is confirmed attached and registered as stored. Unloading removes the record from the stored registry first, clears the replicated hidden state, restores full visibility and physics, and places the same carcass behind the wagon.
+Version 2.0.1 stores each carcass as an unlimited database record. The original world carcass is consumed only after the server reserves the record, and unloading creates a fresh fully visible physical carcass behind the wagon. This avoids stale hidden entities and network-ID reuse after resource or full-server restarts.
+
+
+## v2.0.0
+
+- Unlimited carcass records per owned wagon.
+- Stored carcasses no longer remain as hidden physical entities.
+- Fresh visible carcasses are recreated on unload.
+- Resource and full-server restarts clear stale live network IDs and legacy hidden entities.
+
+## v2.0.1 visibility repair
+
+Recreated RedM animal peds now receive their required metaped outfit variation before death. The world-carcass visibility marker is replicated so a carcass remains rendered when it streams to another client or network ownership changes.
